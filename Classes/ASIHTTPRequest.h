@@ -60,7 +60,8 @@ typedef enum _ASINetworkErrorType {
 	ASIFileManagementError = 8,
 	ASITooMuchRedirectionErrorType = 9,
 	ASIUnhandledExceptionError = 10,
-	ASICompressionError = 11
+	ASICompressionError = 11,
+	ASITrustValidationErrorType = 12
 	
 } ASINetworkErrorType;
 
@@ -369,6 +370,12 @@ typedef void (^ASIDataBlock)(NSData *data);
     // If not nil and the URL scheme is https, CFNetwork configured to supply a client certificate
     SecIdentityRef clientCertificateIdentity;
 	NSArray *clientCertificates;
+    
+    // If not nil and the URL scheme is https, validate the server's certificate against only these roots
+    NSArray *trustedRootCertificates;
+    
+    // Internal state for validating trusted roots
+    BOOL shouldApplyTrustPolicy;
 	
 	// Details on the proxy to use - you could set these yourself, but it's probably best to let ASIHTTPRequest detect the system proxy settings
 	NSString *proxyHost;
@@ -995,6 +1002,7 @@ typedef void (^ASIDataBlock)(NSData *data);
 @property (assign, readonly) BOOL didUseCachedResponse;
 @property (assign) NSTimeInterval secondsToCache;
 @property (retain) NSArray *clientCertificates;
+@property (retain) NSArray *trustedRootCertificates;
 #if TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_4_0
 @property (assign) BOOL shouldContinueWhenAppEntersBackground;
 #endif

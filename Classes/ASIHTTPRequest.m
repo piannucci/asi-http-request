@@ -62,6 +62,7 @@ static NSError *ASIRequestTimedOutError;
 static NSError *ASIAuthenticationError;
 static NSError *ASIUnableToCreateRequestError;
 static NSError *ASITooMuchRedirectionError;
+static NSError *ASITrustValidationError;
 
 static NSMutableArray *bandwidthUsageTracker = nil;
 static unsigned long averageBandwidthUsedPerSecond = 0;
@@ -239,6 +240,7 @@ static NSOperationQueue *sharedQueue = nil;
 @property (retain, nonatomic) NSTimer *statusTimer;
 @property (assign) BOOL didUseCachedResponse;
 @property (retain, nonatomic) NSURL *redirectURL;
+@property (assign) BOOL shouldApplyTrustPolicy;
 
 @property (assign, nonatomic) BOOL isPACFileRequest;
 @property (retain, nonatomic) ASIHTTPRequest *PACFileRequest;
@@ -269,6 +271,7 @@ static NSOperationQueue *sharedQueue = nil;
 		ASIRequestCancelledError = [[NSError alloc] initWithDomain:NetworkRequestErrorDomain code:ASIRequestCancelledErrorType userInfo:[NSDictionary dictionaryWithObjectsAndKeys:@"The request was cancelled",NSLocalizedDescriptionKey,nil]];
 		ASIUnableToCreateRequestError = [[NSError alloc] initWithDomain:NetworkRequestErrorDomain code:ASIUnableToCreateRequestErrorType userInfo:[NSDictionary dictionaryWithObjectsAndKeys:@"Unable to create request (bad url?)",NSLocalizedDescriptionKey,nil]];
 		ASITooMuchRedirectionError = [[NSError alloc] initWithDomain:NetworkRequestErrorDomain code:ASITooMuchRedirectionErrorType userInfo:[NSDictionary dictionaryWithObjectsAndKeys:@"The request failed because it redirected too many times",NSLocalizedDescriptionKey,nil]];
+		ASITrustValidationError = [[NSError alloc] initWithDomain:NetworkRequestErrorDomain code:ASITrustValidationErrorType userInfo:[NSDictionary dictionaryWithObjectsAndKeys:@"The request failed because the server's identity could not be verified",NSLocalizedDescriptionKey,nil]];
 		sharedQueue = [[NSOperationQueue alloc] init];
 		[sharedQueue setMaxConcurrentOperationCount:4];
 
@@ -308,6 +311,8 @@ static NSOperationQueue *sharedQueue = nil;
 	[self setURL:newURL];
 	[self setCancelledLock:[[[NSRecursiveLock alloc] init] autorelease]];
 	[self setDownloadCache:[[self class] defaultCache]];
+	[self setShouldApplyTrustPolicy:NO];
+	[self setTrustRootCertificatesExclusively:NO];
 	return self;
 }
 
@@ -388,6 +393,7 @@ static NSOperationQueue *sharedQueue = nil;
 	[postBodyReadStream release];
 	[PACurl release];
 	[clientCertificates release];
+	[trustedRootCertificates release];
 	[responseStatusMessage release];
 	[connectionInfo release];
 	[requestID release];
@@ -1208,7 +1214,7 @@ static NSOperationQueue *sharedQueue = nil;
     if([[[[self url] scheme] lowercaseString] isEqualToString:@"https"]) {       
        
         // Tell CFNetwork not to validate SSL certificates
-        if (![self validatesSecureCertificate]) {
+        if (![self validatesSecureCertificate] || ([self trustedRootCertificates] != nil)) {
             // see: http://iphonedevelopment.blogspot.com/2010/05/nsstream-tcp-and-ssl.html
             
             NSDictionary *sslProperties = [[NSDictionary alloc] initWithObjectsAndKeys:
@@ -1221,6 +1227,7 @@ static NSOperationQueue *sharedQueue = nil;
             CFReadStreamSetProperty((CFReadStreamRef)[self readStream], 
                                     kCFStreamPropertySSLSettings, 
                                     (CFTypeRef)sslProperties);
+            [self setShouldApplyTrustPolicy:[self trustedRootCertificates] != nil];
             [sslProperties release];
         } 
         
@@ -1647,6 +1654,8 @@ static NSOperationQueue *sharedQueue = nil;
 	[headRequest setShouldUseRFC2616RedirectBehaviour:[self shouldUseRFC2616RedirectBehaviour]];
 	[headRequest setShouldAttemptPersistentConnection:[self shouldAttemptPersistentConnection]];
 	[headRequest setPersistentConnectionTimeoutSeconds:[self persistentConnectionTimeoutSeconds]];
+	[headRequest setTrustedRootCertificates:[self trustedRootCertificates]];
+	[headRequest setTrustRootCertificatesExclusively:[self trustRootCertificatesExclusively]];
 	
 	[headRequest setMainRequest:self];
 	[headRequest setRequestMethod:@"HEAD"];
@@ -3184,11 +3193,37 @@ static NSOperationQueue *sharedQueue = nil;
 	}
 
 	CFRetain(self);
+    
+    if ([self shouldApplyTrustPolicy])
+    {
+        if (type == kCFStreamEventHasBytesAvailable || type == kCFStreamEventCanAcceptBytes)
+        {
+            SecTrustRef trust = (SecTrustRef)CFReadStreamCopyProperty((CFReadStreamRef)[self readStream], kCFStreamPropertySSLPeerTrust);
+            SecTrustSetAnchorCertificates(trust, (CFArrayRef)[self trustedRootCertificates]);
+            if (!trustRootCertificatesExclusively)
+                SecTrustSetAnchorCertificatesOnly(trust, false);
+            SecTrustResultType result;
+            OSStatus status = SecTrustEvaluate(trust, &result);
+            if (status == noErr && (result == kSecTrustResultProceed || result == kSecTrustResultUnspecified))
+            {
+                // permit the connection
+            }
+            else
+            {
+                [self cancelLoad];
+                [self failWithError:ASITrustValidationError];
+            }
+            [self setShouldApplyTrustPolicy:NO];
+            CFRelease(trust);
+        }
+    }
 
     // Dispatch the stream events.
     switch (type) {
         case kCFStreamEventHasBytesAvailable:
-            [self handleBytesAvailable];
+            // if stream has been torn down, don't use it
+            if ([self readStream])
+                [self handleBytesAvailable];
             break;
             
         case kCFStreamEventEndEncountered:
@@ -4099,6 +4134,8 @@ static NSOperationQueue *sharedQueue = nil;
 	[newRequest setShouldAttemptPersistentConnection:[self shouldAttemptPersistentConnection]];
 	[newRequest setPersistentConnectionTimeoutSeconds:[self persistentConnectionTimeoutSeconds]];
     [newRequest setAuthenticationScheme:[self authenticationScheme]];
+	[newRequest setTrustedRootCertificates:[self trustedRootCertificates]];
+	[newRequest setTrustRootCertificatesExclusively:[self trustRootCertificatesExclusively]];
 	return newRequest;
 }
 
@@ -5109,6 +5146,9 @@ static NSOperationQueue *sharedQueue = nil;
 @synthesize didUseCachedResponse;
 @synthesize secondsToCache;
 @synthesize clientCertificates;
+@synthesize trustedRootCertificates;
+@synthesize trustRootCertificatesExclusively;
+@synthesize shouldApplyTrustPolicy;
 @synthesize redirectURL;
 #if TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_4_0
 @synthesize shouldContinueWhenAppEntersBackground;

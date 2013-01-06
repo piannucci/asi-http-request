@@ -240,7 +240,6 @@ static NSOperationQueue *sharedQueue = nil;
 @property (retain, nonatomic) NSTimer *statusTimer;
 @property (assign) BOOL didUseCachedResponse;
 @property (retain, nonatomic) NSURL *redirectURL;
-@property (assign) BOOL shouldApplyTrustPolicy;
 
 @property (assign, nonatomic) BOOL isPACFileRequest;
 @property (retain, nonatomic) ASIHTTPRequest *PACFileRequest;
@@ -311,7 +310,6 @@ static NSOperationQueue *sharedQueue = nil;
 	[self setURL:newURL];
 	[self setCancelledLock:[[[NSRecursiveLock alloc] init] autorelease]];
 	[self setDownloadCache:[[self class] defaultCache]];
-	[self setShouldApplyTrustPolicy:NO];
 	[self setTrustRootCertificatesExclusively:NO];
 	return self;
 }
@@ -1135,6 +1133,33 @@ static NSOperationQueue *sharedQueue = nil;
 	}
 }
 
+
+static NSDictionary *_bypassValidationSSLProperties = nil;
++ (NSDictionary *)bypassValidationSSLProperties
+{
+    if (!_bypassValidationSSLProperties)
+    {
+        _bypassValidationSSLProperties = [[NSDictionary alloc] initWithObjectsAndKeys:
+                                          [NSNumber numberWithBool:YES], kCFStreamSSLAllowsExpiredCertificates,
+                                          [NSNumber numberWithBool:YES], kCFStreamSSLAllowsAnyRoot,
+                                          [NSNumber numberWithBool:NO],  kCFStreamSSLValidatesCertificateChain,
+                                          kCFNull,kCFStreamSSLPeerName,
+                                          nil];
+    }
+    return _bypassValidationSSLProperties;
+}
+
+
+- (BOOL)isCompatibleWithConnectionInfo:(NSDictionary *)info
+{
+    return [[info objectForKey:@"host"] isEqualToString:self.url.host] &&
+           [[info objectForKey:@"scheme"] isEqualToString:self.url.scheme] &&
+           [[info objectForKey:@"port"] isEqualToNumber:self.url.port] &&
+           [[info objectForKey:@"trustedRootCertificates"] isEqualToArray:self.trustedRootCertificates] &&
+           [[info objectForKey:@"trustRootCertificatesExclusively"] boolValue] == self.trustRootCertificatesExclusively;
+}
+
+
 - (void)startRequest
 {
 	if ([self isCancelled]) {
@@ -1217,18 +1242,9 @@ static NSOperationQueue *sharedQueue = nil;
         if (![self validatesSecureCertificate] || ([self trustedRootCertificates] != nil)) {
             // see: http://iphonedevelopment.blogspot.com/2010/05/nsstream-tcp-and-ssl.html
             
-            NSDictionary *sslProperties = [[NSDictionary alloc] initWithObjectsAndKeys:
-                                      [NSNumber numberWithBool:YES], kCFStreamSSLAllowsExpiredCertificates,
-                                      [NSNumber numberWithBool:YES], kCFStreamSSLAllowsAnyRoot,
-                                      [NSNumber numberWithBool:NO],  kCFStreamSSLValidatesCertificateChain,
-                                      kCFNull,kCFStreamSSLPeerName,
-                                      nil];
-            
             CFReadStreamSetProperty((CFReadStreamRef)[self readStream], 
                                     kCFStreamPropertySSLSettings, 
-                                    (CFTypeRef)sslProperties);
-            [self setShouldApplyTrustPolicy:[self trustedRootCertificates] != nil];
-            [sslProperties release];
+                                    (CFTypeRef)[ASIHTTPRequest bypassValidationSSLProperties]);
         } 
         
         // Tell CFNetwork to use a client certificate
@@ -1309,8 +1325,8 @@ static NSOperationQueue *sharedQueue = nil;
 		// If we are redirecting, we will re-use the current connection only if we are connecting to the same server
 		if ([self connectionInfo]) {
 			
-			if (![[[self connectionInfo] objectForKey:@"host"] isEqualToString:[[self url] host]] || ![[[self connectionInfo] objectForKey:@"scheme"] isEqualToString:[[self url] scheme]] || [(NSNumber *)[[self connectionInfo] objectForKey:@"port"] intValue] != [[[self url] port] intValue]) {
-				[self setConnectionInfo:nil];
+            if (![self isCompatibleWithConnectionInfo:self.connectionInfo]) {
+                self.connectionInfo = nil;
 
 			// Check if we should have expired this connection
 			} else if ([[[self connectionInfo] objectForKey:@"expires"] timeIntervalSinceNow] < 0) {
@@ -1335,7 +1351,8 @@ static NSOperationQueue *sharedQueue = nil;
 			
 			// Look for a connection to the same server in the pool
 			for (NSMutableDictionary *existingConnection in persistentConnectionsPool) {
-				if (![existingConnection objectForKey:@"request"] && [[existingConnection objectForKey:@"host"] isEqualToString:[[self url] host]] && [[existingConnection objectForKey:@"scheme"] isEqualToString:[[self url] scheme]] && [(NSNumber *)[existingConnection objectForKey:@"port"] intValue] == [[[self url] port] intValue]) {
+				if (![existingConnection objectForKey:@"request"] &&
+                    [self isCompatibleWithConnectionInfo:existingConnection]) {
 					[self setConnectionInfo:existingConnection];
 				}
 			}
@@ -1348,12 +1365,15 @@ static NSOperationQueue *sharedQueue = nil;
 		
 		// No free connection was found in the pool matching the server/scheme/port we're connecting to, we'll need to create a new one
 		if (![self connectionInfo]) {
-			[self setConnectionInfo:[NSMutableDictionary dictionary]];
-			nextConnectionNumberToCreate++;
-			[[self connectionInfo] setObject:[NSNumber numberWithInt:nextConnectionNumberToCreate] forKey:@"id"];
-			[[self connectionInfo] setObject:[[self url] host] forKey:@"host"];
-			[[self connectionInfo] setObject:[NSNumber numberWithInt:[[[self url] port] intValue]] forKey:@"port"];
-			[[self connectionInfo] setObject:[[self url] scheme] forKey:@"scheme"];
+			self.connectionInfo = [NSMutableDictionary dictionaryWithObjectsAndKeys:
+                                   [NSNumber numberWithInt:++nextConnectionNumberToCreate], @"id",
+                                   self.url.host, @"host",
+                                   self.url.port, @"port",
+                                   self.url.scheme, @"scheme",
+                                   self.trustedRootCertificates, @"trustedRootCertificates",
+                                   [NSNumber numberWithBool:self.trustRootCertificatesExclusively], @"trustRootCertificatesExclusively",
+                                   nil];
+            
 			[persistentConnectionsPool addObject:[self connectionInfo]];
 		}
 		
@@ -2954,6 +2974,7 @@ static NSOperationQueue *sharedQueue = nil;
 	if (!requestAuthentication) {
 		CFHTTPMessageRef responseHeader = (CFHTTPMessageRef) CFReadStreamCopyProperty((CFReadStreamRef)[self readStream],kCFStreamPropertyHTTPResponseHeader);
 		requestAuthentication = CFHTTPAuthenticationCreateFromResponse(NULL, responseHeader);
+        self.responseHeaders = [NSMakeCollectable(CFHTTPMessageCopyAllHeaderFields(responseHeader)) autorelease];
 		CFRelease(responseHeader);
 		[self setAuthenticationScheme:[NSMakeCollectable(CFHTTPAuthenticationCopyMethod(requestAuthentication)) autorelease]];
 	}
@@ -3194,48 +3215,52 @@ static NSOperationQueue *sharedQueue = nil;
 
 	CFRetain(self);
     
-    if ([self shouldApplyTrustPolicy])
+    NSDictionary *rootCertificates = [[self connectionInfo] objectForKey:@"trustedRootCertificates"];
+    BOOL rootCertificatesExclusively = [[[self connectionInfo] objectForKey:@"trustRootCertificatesExclusively"] boolValue];
+    if (![[self.connectionInfo objectForKey:@"validated"] boolValue] && rootCertificates)
     {
         if (type == kCFStreamEventHasBytesAvailable || type == kCFStreamEventCanAcceptBytes)
         {
             SecTrustRef trust = (SecTrustRef)CFReadStreamCopyProperty((CFReadStreamRef)[self readStream], kCFStreamPropertySSLPeerTrust);
-            SecTrustSetAnchorCertificates(trust, (CFArrayRef)[self trustedRootCertificates]);
-            if (!trustRootCertificatesExclusively)
+            SecTrustSetAnchorCertificates(trust, (CFArrayRef)rootCertificates);
+            if (!rootCertificatesExclusively)
                 SecTrustSetAnchorCertificatesOnly(trust, false);
             SecTrustResultType result;
             OSStatus status = SecTrustEvaluate(trust, &result);
             if (status == noErr && (result == kSecTrustResultProceed || result == kSecTrustResultUnspecified))
             {
                 // permit the connection
+                [[self connectionInfo] setObject:[NSNumber numberWithBool:YES] forKey:@"validated"];
             }
             else
             {
                 [self cancelLoad];
                 [self failWithError:ASITrustValidationError];
+                // the connection won't be used again.
             }
-            [self setShouldApplyTrustPolicy:NO];
             CFRelease(trust);
         }
     }
 
-    // Dispatch the stream events.
-    switch (type) {
-        case kCFStreamEventHasBytesAvailable:
-            // if stream has been torn down, don't use it
-            if ([self readStream])
+    if ([self readStream]) {
+        // Dispatch the stream events.
+        switch (type) {
+            case kCFStreamEventHasBytesAvailable:
+                // if stream has been torn down, don't use it
                 [self handleBytesAvailable];
-            break;
-            
-        case kCFStreamEventEndEncountered:
-            [self handleStreamComplete];
-            break;
-            
-        case kCFStreamEventErrorOccurred:
-            [self handleStreamError];
-            break;
-            
-        default:
-            break;
+                break;
+                
+            case kCFStreamEventEndEncountered:
+                [self handleStreamComplete];
+                break;
+                
+            case kCFStreamEventErrorOccurred:
+                [self handleStreamError];
+                break;
+                
+            default:
+                break;
+        }
     }
 	
 	[self performThrottling];
@@ -5148,7 +5173,6 @@ static NSOperationQueue *sharedQueue = nil;
 @synthesize clientCertificates;
 @synthesize trustedRootCertificates;
 @synthesize trustRootCertificatesExclusively;
-@synthesize shouldApplyTrustPolicy;
 @synthesize redirectURL;
 #if TARGET_OS_IPHONE && __IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_4_0
 @synthesize shouldContinueWhenAppEntersBackground;
